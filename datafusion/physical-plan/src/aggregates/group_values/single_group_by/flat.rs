@@ -940,4 +940,192 @@ mod tests {
             None
         ]
     );
+
+    // Temporal types are i32/i64-backed, so they ride the same flat path. Dense,
+    // low-range values (as in `GROUP BY date`) must engage flat and match hash.
+    assert_flat_matches_hash!(
+        flat_matches_hash_date32,
+        arrow::array::types::Date32Type,
+        arrow::array::Date32Array,
+        i32,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_date64,
+        arrow::array::types::Date64Type,
+        arrow::array::Date64Array,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_time32_second,
+        arrow::array::types::Time32SecondType,
+        arrow::array::Time32SecondArray,
+        i32,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_time32_millisecond,
+        arrow::array::types::Time32MillisecondType,
+        arrow::array::Time32MillisecondArray,
+        i32,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_time64_microsecond,
+        arrow::array::types::Time64MicrosecondType,
+        arrow::array::Time64MicrosecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_time64_nanosecond,
+        arrow::array::types::Time64NanosecondType,
+        arrow::array::Time64NanosecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_timestamp_second,
+        arrow::array::types::TimestampSecondType,
+        arrow::array::TimestampSecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_timestamp_millisecond,
+        arrow::array::types::TimestampMillisecondType,
+        arrow::array::TimestampMillisecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_timestamp_microsecond,
+        arrow::array::types::TimestampMicrosecondType,
+        arrow::array::TimestampMicrosecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_timestamp_nanosecond,
+        arrow::array::types::TimestampNanosecondType,
+        arrow::array::TimestampNanosecondArray,
+        i64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+
+    // A timestamp's timezone lives in the DataType, not in `T::DATA_TYPE` (which is
+    // always `None`). Flat's emit must restore it via `build_native`'s `with_data_type`,
+    // otherwise the output silently drops the zone. This is the C4 fix C2 relies on.
+    #[test]
+    fn timestamp_with_timezone_preserves_tz_on_emit() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::array::types::TimestampNanosecondType;
+
+        let arr =
+            TimestampNanosecondArray::from(vec![Some(3i64), Some(1), None, Some(3)])
+                .with_timezone("UTC");
+        let dt = arr.data_type().clone();
+        let col: ArrayRef = Arc::new(arr);
+
+        let mut flat =
+            GroupValuesFlatPrimitive::<TimestampNanosecondType>::new(dt.clone());
+        let mut groups = vec![];
+        flat.intern(std::slice::from_ref(&col), &mut groups)
+            .unwrap();
+        assert!(matches!(flat.mode, Mode::Flat { .. }));
+
+        let out = flat.emit(EmitTo::All).unwrap();
+        assert_eq!(out[0].data_type(), &dt, "emit must preserve the timezone");
+    }
 }

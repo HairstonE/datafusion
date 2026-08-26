@@ -157,6 +157,26 @@ pub fn new_group_values(
             DataType::UInt16 => flat_helper!(UInt16Type),
             DataType::UInt32 => flat_helper!(UInt32Type),
             DataType::UInt64 => flat_helper!(UInt64Type),
+            DataType::Date32 => flat_helper!(Date32Type),
+            DataType::Date64 => flat_helper!(Date64Type),
+            DataType::Time32(TimeUnit::Second) => flat_helper!(Time32SecondType),
+            DataType::Time32(TimeUnit::Millisecond) => {
+                flat_helper!(Time32MillisecondType)
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                flat_helper!(Time64MicrosecondType)
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => flat_helper!(Time64NanosecondType),
+            DataType::Timestamp(TimeUnit::Second, _) => flat_helper!(TimestampSecondType),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                flat_helper!(TimestampMillisecondType)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                flat_helper!(TimestampMicrosecondType)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                flat_helper!(TimestampNanosecondType)
+            }
             _ => {}
         }
 
@@ -172,28 +192,6 @@ pub fn new_group_values(
         }
 
         match d {
-            DataType::Date32 => {
-                downcast_helper!(Date32Type, d);
-            }
-            DataType::Date64 => {
-                downcast_helper!(Date64Type, d);
-            }
-            DataType::Time32(t) => match t {
-                TimeUnit::Second => downcast_helper!(Time32SecondType, d),
-                TimeUnit::Millisecond => downcast_helper!(Time32MillisecondType, d),
-                _ => {}
-            },
-            DataType::Time64(t) => match t {
-                TimeUnit::Microsecond => downcast_helper!(Time64MicrosecondType, d),
-                TimeUnit::Nanosecond => downcast_helper!(Time64NanosecondType, d),
-                _ => {}
-            },
-            DataType::Timestamp(t, _tz) => match t {
-                TimeUnit::Second => downcast_helper!(TimestampSecondType, d),
-                TimeUnit::Millisecond => downcast_helper!(TimestampMillisecondType, d),
-                TimeUnit::Microsecond => downcast_helper!(TimestampMicrosecondType, d),
-                TimeUnit::Nanosecond => downcast_helper!(TimestampNanosecondType, d),
-            },
             DataType::Decimal128(_, _) => {
                 downcast_helper!(Decimal128Type, d);
             }
@@ -230,5 +228,51 @@ pub fn new_group_values(
         }
     } else {
         Ok(Box::new(GroupValuesRows::try_new(schema)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Date32Array, TimestampNanosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_expr::EmitTo;
+    use std::sync::Arc;
+
+    fn single_col(dt: DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("g", dt, true)]))
+    }
+
+    // A single temporal column must reach the flat grouper via dispatch and produce
+    // correct group ids. A mis-routed arm (wrong `T`) would panic in `as_primitive::<T>`.
+    #[test]
+    fn dispatch_date32_groups_correctly() {
+        let schema = single_col(DataType::Date32);
+        let mut gv = new_group_values(schema, &GroupOrdering::None).unwrap();
+        let col: ArrayRef =
+            Arc::new(Date32Array::from(vec![Some(5), Some(5), None, Some(7)]));
+        let mut groups = vec![];
+        gv.intern(std::slice::from_ref(&col), &mut groups).unwrap();
+        assert_eq!(groups, vec![0, 0, 1, 2]);
+        let out = gv.emit(EmitTo::All).unwrap();
+        assert_eq!(out[0].data_type(), &DataType::Date32);
+    }
+
+    // End-to-end proof of the C4 fix through the public entry point: the emitted
+    // array must keep the column's timezone, not the type constant's `None`.
+    #[test]
+    fn dispatch_timestamp_preserves_timezone() {
+        let dt = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let schema = single_col(dt.clone());
+        let mut gv = new_group_values(schema, &GroupOrdering::None).unwrap();
+        let col: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(vec![Some(5i64), Some(5), None, Some(7)])
+                .with_timezone("UTC"),
+        );
+        let mut groups = vec![];
+        gv.intern(std::slice::from_ref(&col), &mut groups).unwrap();
+        assert_eq!(groups, vec![0, 0, 1, 2]);
+        let out = gv.emit(EmitTo::All).unwrap();
+        assert_eq!(out[0].data_type(), &dt);
     }
 }
