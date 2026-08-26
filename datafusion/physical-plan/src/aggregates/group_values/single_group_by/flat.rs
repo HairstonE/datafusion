@@ -35,6 +35,8 @@ const SPARSE_FACTOR: u64 = 4; // fall back when range > distinct * this (too spa
 pub(crate) trait FlatKey: Copy {
     /// Order-preserving map into `u64`, so offset math is one 64-bit subtract.
     fn to_ordered_u64(self) -> u64;
+
+    fn from_ordered_u64(v: u64) -> Self;
 }
 
 macro_rules! impl_flat_key_signed {
@@ -43,6 +45,10 @@ macro_rules! impl_flat_key_signed {
               #[inline]
               fn to_ordered_u64(self) -> u64 {
                   (self as i64 as u64) ^ (1 << 63)
+              }
+              #[inline]
+              fn from_ordered_u64(v: u64) -> Self {
+                  ((v ^ (1 << 63)) as i64) as $t
               }
           }
       )+};
@@ -54,6 +60,10 @@ macro_rules! impl_flat_key_unsigned {
               #[inline]
               fn to_ordered_u64(self) -> u64 {
                   self as u64
+              }
+              #[inline]
+              fn from_ordered_u64(v: u64) -> Self {
+                  v as $t
               }
           }
       )+};
@@ -75,8 +85,8 @@ enum Mode<T: ArrowPrimitiveType> {
 pub(crate) struct GroupValuesFlatPrimitive<T: ArrowPrimitiveType> {
     data_type: DataType,
     mode: Mode<T>,
-    values: Vec<T::Native>,
-    overflow: HashMap<T::Native, usize>,
+    values: Vec<u64>,
+    overflow: HashMap<u64, usize>,
     null_group: Option<usize>,
 }
 
@@ -124,69 +134,76 @@ where
         };
     }
 
-    #[inline]
-    fn intern_key(
-        offset: u64,
-        data: &mut Vec<u32>,
-        occupied: &mut usize,
-        values: &mut Vec<T::Native>,
-        overflow: &mut HashMap<T::Native, usize>,
-        key: T::Native,
-    ) -> usize {
-        // Out of window (below offset wraps huge, above exceeds len)
-        let raw = key.to_ordered_u64().wrapping_sub(offset);
-        if raw >= data.len() as u64 {
-            return Self::intern_key_outside(raw, data, occupied, values, overflow, key);
-        }
+    fn build_native(&self, keys: Vec<u64>, null_idx: Option<usize>) -> ArrayRef {
+        let values: Vec<T::Native> =
+            keys.into_iter().map(T::Native::from_ordered_u64).collect();
+        Arc::new(
+            build_primitive::<T>(values, null_idx).with_data_type(self.data_type.clone()),
+        )
+    }
+}
 
-        // in window
-        let slot = &mut data[raw as usize];
-        if *slot != 0 {
-            return (*slot - 1) as usize;
-        }
+#[inline]
+fn intern_key(
+    offset: u64,
+    data: &mut Vec<u32>,
+    occupied: &mut usize,
+    values: &mut Vec<u64>,
+    overflow: &mut HashMap<u64, usize>,
+    key: u64,
+) -> usize {
+    // Out of window (below offset wraps huge, above exceeds len)
+    let raw = key.wrapping_sub(offset);
+    if raw >= data.len() as u64 {
+        return intern_key_outside(raw, data, occupied, values, overflow, key);
+    }
+
+    // in window
+    let slot = &mut data[raw as usize];
+    if *slot != 0 {
+        return (*slot - 1) as usize;
+    }
+    let g = values.len();
+    values.push(key);
+    *slot = g as u32 + 1;
+    *occupied += 1;
+    g
+}
+
+/// Cold path: grow the window up to `MAX_FLAT_RANGE`, else spill to overflow.
+#[cold]
+#[inline(never)]
+fn intern_key_outside(
+    idx: u64,
+    data: &mut Vec<u32>,
+    occupied: &mut usize,
+    values: &mut Vec<u64>,
+    overflow: &mut HashMap<u64, usize>,
+    key: u64,
+) -> usize {
+    if idx < MAX_FLAT_RANGE && idx < (*occupied as u64).saturating_mul(SPARSE_FACTOR) {
+        let idx = idx as usize;
+        data.resize(idx + 1, 0);
         let g = values.len();
         values.push(key);
-        *slot = g as u32 + 1;
+        data[idx] = g as u32 + 1;
         *occupied += 1;
         g
-    }
-
-    /// Cold path: grow the window up to `MAX_FLAT_RANGE`, else spill to overflow.
-    #[cold]
-    #[inline(never)]
-    fn intern_key_outside(
-        idx: u64,
-        data: &mut Vec<u32>,
-        occupied: &mut usize,
-        values: &mut Vec<T::Native>,
-        overflow: &mut HashMap<T::Native, usize>,
-        key: T::Native,
-    ) -> usize {
-        if idx < MAX_FLAT_RANGE && idx < (*occupied as u64).saturating_mul(SPARSE_FACTOR)
-        {
-            let idx = idx as usize;
-            data.resize(idx + 1, 0);
+    } else {
+        *overflow.entry(key).or_insert_with(|| {
             let g = values.len();
             values.push(key);
-            data[idx] = g as u32 + 1;
-            *occupied += 1;
-            g
-        } else {
-            *overflow.entry(key).or_insert_with(|| {
-                let g = values.len();
-                values.push(key);
-                g
-            })
-        }
-    }
-
-    fn null_gid(values: &mut Vec<T::Native>, null_group: &mut Option<usize>) -> usize {
-        *null_group.get_or_insert_with(|| {
-            let g = values.len();
-            values.push(Default::default());
             g
         })
     }
+}
+
+fn null_gid(values: &mut Vec<u64>, null_group: &mut Option<usize>) -> usize {
+    *null_group.get_or_insert_with(|| {
+        let g = values.len();
+        values.push(0);
+        g
+    })
 }
 
 impl<T: ArrowPrimitiveType> GroupValues for GroupValuesFlatPrimitive<T>
@@ -219,13 +236,13 @@ where
                 // Fast path: no nulls.
                 if values.null_count() == 0 {
                     for &key in values.values().iter() {
-                        let g = Self::intern_key(
+                        let g = intern_key(
                             offset,
                             data,
                             occupied,
                             &mut self.values,
                             &mut self.overflow,
-                            key,
+                            key.to_ordered_u64(),
                         );
                         groups.push(g);
                     }
@@ -234,14 +251,14 @@ where
 
                 for v in values {
                     let g = match v {
-                        None => Self::null_gid(&mut self.values, &mut self.null_group),
-                        Some(key) => Self::intern_key(
+                        None => null_gid(&mut self.values, &mut self.null_group),
+                        Some(key) => intern_key(
                             offset,
                             data,
                             occupied,
                             &mut self.values,
                             &mut self.overflow,
-                            key,
+                            key.to_ordered_u64(),
                         ),
                     };
                     groups.push(g);
@@ -255,13 +272,13 @@ where
         if let Mode::Fallback(inner) = &mut self.mode {
             return inner.emit(emit_to);
         }
-        let array: PrimitiveArray<T> = match emit_to {
+        let (keys, null_idx) = match emit_to {
             EmitTo::All => {
                 self.mode = Mode::Uninit;
                 self.overflow.clear();
-                let values = std::mem::take(&mut self.values);
+                let keys = std::mem::take(&mut self.values);
                 let null = self.null_group.take();
-                build_primitive(values, null)
+                (keys, null)
             }
             EmitTo::First(n) => {
                 if let Mode::Flat { data, occupied, .. } = &mut self.mode {
@@ -306,10 +323,10 @@ where
                     Some(_) => self.null_group.take(),
                     None => None,
                 };
-                build_primitive(split_vec_min_alloc(&mut self.values, n), null_group)
+                (split_vec_min_alloc(&mut self.values, n), null_group)
             }
         };
-        Ok(vec![Arc::new(array)])
+        Ok(vec![self.build_native(keys, null_idx)])
     }
 
     fn size(&self) -> usize {
@@ -323,7 +340,7 @@ where
             _ => 0,
         };
         data + self.values.allocated_size()
-            + self.overflow.capacity() * size_of::<(T::Native, usize)>()
+            + self.overflow.capacity() * size_of::<(u64, usize)>()
     }
 
     fn is_empty(&self) -> bool {
@@ -719,4 +736,208 @@ mod tests {
             gv.overflow.capacity()
         );
     }
+
+    // `from_ordered_u64` must be the exact inverse of `to_ordered_u64`, and the
+    // map must preserve ordering (smaller native key -> smaller ordered u64).
+    // This is the invariant the whole ordered-u64 storage refactor rests on.
+    #[test]
+    fn ordered_u64_roundtrips() {
+        macro_rules! check {
+            ($($t:ty),+) => {$(
+                for v in [<$t>::MIN, <$t>::MAX, 0 as $t] {
+                    assert_eq!(
+                        <$t as FlatKey>::from_ordered_u64(v.to_ordered_u64()),
+                        v,
+                        "round-trip failed for {} value {}",
+                        stringify!($t),
+                        v
+                    );
+                }
+            )+};
+        }
+        check!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+        assert!((-1i32).to_ordered_u64() < 0i32.to_ordered_u64());
+        assert!(0i32.to_ordered_u64() < 1i32.to_ordered_u64());
+        assert!(i32::MIN.to_ordered_u64() < i32::MAX.to_ordered_u64());
+        assert!(i64::MIN.to_ordered_u64() < i64::MAX.to_ordered_u64());
+        assert!(0u64.to_ordered_u64() < u64::MAX.to_ordered_u64());
+    }
+
+    // For each integer native type, the flat grouper must produce the same group
+    // ids and the same emitted array (values + DataType) as the hash grouper.
+    // The pre-existing tests only covered Int32/UInt64; this closes the rest.
+    macro_rules! assert_flat_matches_hash {
+        ($name:ident, $ty:ty, $arr:ty, $native:ty, $vals:expr) => {
+            #[test]
+            fn $name() {
+                let vals: Vec<Option<$native>> = $vals;
+                let col: ArrayRef = Arc::new(<$arr>::from(vals));
+                let dt = <$ty as ArrowPrimitiveType>::DATA_TYPE;
+
+                let mut flat = GroupValuesFlatPrimitive::<$ty>::new(dt.clone());
+                let mut flat_groups = vec![];
+                flat.intern(std::slice::from_ref(&col), &mut flat_groups)
+                    .unwrap();
+                // the dense small-range inputs must engage the flat path, not fallback
+                assert!(matches!(flat.mode, Mode::Flat { .. }));
+
+                let mut hash = GroupValuesPrimitive::<$ty>::new(dt.clone());
+                let mut hash_groups = vec![];
+                hash.intern(std::slice::from_ref(&col), &mut hash_groups)
+                    .unwrap();
+
+                assert_eq!(
+                    flat_groups,
+                    hash_groups,
+                    "group ids differ for {}",
+                    stringify!($ty)
+                );
+
+                let flat_out = flat.emit(EmitTo::All).unwrap();
+                let hash_out = hash.emit(EmitTo::All).unwrap();
+                assert_eq!(
+                    flat_out[0].as_primitive::<$ty>(),
+                    hash_out[0].as_primitive::<$ty>(),
+                    "emitted values differ for {}",
+                    stringify!($ty)
+                );
+                assert_eq!(
+                    flat_out[0].data_type(),
+                    hash_out[0].data_type(),
+                    "emitted data type differs for {}",
+                    stringify!($ty)
+                );
+            }
+        };
+    }
+
+    assert_flat_matches_hash!(
+        flat_matches_hash_i8,
+        arrow::array::types::Int8Type,
+        arrow::array::Int8Array,
+        i8,
+        vec![
+            Some(3),
+            Some(-2),
+            None,
+            Some(3),
+            Some(0),
+            Some(-2),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_i16,
+        arrow::array::types::Int16Type,
+        arrow::array::Int16Array,
+        i16,
+        vec![
+            Some(3),
+            Some(-2),
+            None,
+            Some(3),
+            Some(0),
+            Some(-2),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_i32,
+        Int32Type,
+        Int32Array,
+        i32,
+        vec![
+            Some(3),
+            Some(-2),
+            None,
+            Some(3),
+            Some(0),
+            Some(-2),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_i64,
+        arrow::array::types::Int64Type,
+        arrow::array::Int64Array,
+        i64,
+        vec![
+            Some(3),
+            Some(-2),
+            None,
+            Some(3),
+            Some(0),
+            Some(-2),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_u8,
+        arrow::array::types::UInt8Type,
+        arrow::array::UInt8Array,
+        u8,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_u16,
+        arrow::array::types::UInt16Type,
+        arrow::array::UInt16Array,
+        u16,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_u32,
+        arrow::array::types::UInt32Type,
+        arrow::array::UInt32Array,
+        u32,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
+    assert_flat_matches_hash!(
+        flat_matches_hash_u64,
+        arrow::array::types::UInt64Type,
+        arrow::array::UInt64Array,
+        u64,
+        vec![
+            Some(3),
+            Some(1),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(5),
+            None
+        ]
+    );
 }
