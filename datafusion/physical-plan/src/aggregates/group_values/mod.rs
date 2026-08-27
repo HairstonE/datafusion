@@ -258,13 +258,9 @@ pub(crate) fn flat_stats_hint(agg: &AggregateExec) -> Option<FlatStatsHint> {
     };
     let col = expr.downcast_ref::<Column>()?;
 
-    if !agg
-        .input
-        .schema()
-        .field(col.index())
-        .data_type()
-        .is_integer()
-    {
+    let schema = agg.input.schema();
+    let field = schema.fields().get(col.index())?;
+    if !field.data_type().is_integer() {
         return None;
     }
     let stats = StatisticsContext::new()
