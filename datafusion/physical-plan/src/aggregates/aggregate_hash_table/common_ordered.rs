@@ -30,7 +30,9 @@ use datafusion_expr::EmitTo;
 
 use crate::InputOrderMode;
 use crate::PhysicalExpr;
-use crate::aggregates::group_values::{GroupByMetrics, GroupValues, new_group_values};
+use crate::aggregates::group_values::{
+    GroupByMetrics, GroupValues, flat_stats_hint, new_group_values_hinted,
+};
 use crate::aggregates::grouped_hash_stream::create_group_accumulator;
 use crate::aggregates::order::GroupOrdering;
 use crate::aggregates::{
@@ -158,7 +160,8 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
 
         let group_ordering = GroupOrdering::try_new(input_order_mode)?;
         let group_schema = agg.group_by.group_schema(input_schema)?;
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let group_values =
+            new_group_values_hinted(group_schema, &group_ordering, flat_stats_hint(agg))?;
         let aggregate_arguments = aggregate_expressions(
             &agg.aggr_expr,
             aggregate_mode,

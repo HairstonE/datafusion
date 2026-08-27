@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::aggregates::group_values::FlatStatsHint;
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::single_group_by::primitive::{
     GroupValuesPrimitive, HashValue, build_primitive,
@@ -22,6 +23,7 @@ use crate::aggregates::group_values::single_group_by::primitive::{
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, cast::AsArray};
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
+use datafusion_common::ScalarValue;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{HashMap, HashSet};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
@@ -32,6 +34,7 @@ use std::sync::Arc;
 
 const MAX_FLAT_RANGE: u64 = 1 << 16;
 const SPARSE_FACTOR: u64 = 4; // fall back when range > distinct * this (too sparse to pack)
+const STATS_DENSE_BUDGET: u64 = 4096;
 pub(crate) trait FlatKey: Copy {
     /// Order-preserving map into `u64`, so offset math is one 64-bit subtract.
     fn to_ordered_u64(self) -> u64;
@@ -88,6 +91,7 @@ pub(crate) struct GroupValuesFlatPrimitive<T: ArrowPrimitiveType> {
     values: Vec<u64>,
     overflow: HashMap<u64, usize>,
     null_group: Option<usize>,
+    hint: Option<FlatStatsHint>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesFlatPrimitive<T>
@@ -101,10 +105,23 @@ where
             values: Vec::new(),
             overflow: HashMap::default(),
             null_group: None,
+            hint: None,
+        }
+    }
+
+    pub(crate) fn with_hint(data_type: DataType, hint: Option<FlatStatsHint>) -> Self {
+        Self {
+            hint,
+            ..Self::new(data_type)
         }
     }
 
     fn init(&mut self, values: &PrimitiveArray<T>) {
+        if let Some(mode) = self.hint.take().and_then(|h| self.mode_from_hint(&h)) {
+            self.mode = mode;
+            return;
+        }
+
         if values.is_empty() {
             self.mode = Mode::Uninit;
             return;
@@ -134,12 +151,45 @@ where
         };
     }
 
+    fn scalar_to_ordered(s: &ScalarValue) -> Option<u64> {
+        let arr = s.to_array().ok()?;
+        let p = arr.as_primitive_opt::<T>()?;
+        p.is_valid(0).then(|| p.value(0).to_ordered_u64())
+    }
+
+    fn mode_from_hint(&mut self, h: &FlatStatsHint) -> Option<Mode<T>> {
+        let min = Self::scalar_to_ordered(&h.min)?;
+        let max = Self::scalar_to_ordered(&h.max)?;
+        let range = max.checked_sub(min)?;
+        let distinct = h
+            .distinct
+            .map(|d| d as u64)
+            .or_else(|| (range < STATS_DENSE_BUDGET).then_some(range + 1))?;
+        Some(self.choose_mode(min, range, distinct))
+    }
+
+    fn choose_mode(&mut self, offset: u64, range: u64, distinct: u64) -> Mode<T> {
+        if range < MAX_FLAT_RANGE && range < distinct.saturating_mul(SPARSE_FACTOR) {
+            Mode::Flat {
+                offset,
+                data: vec![0; (range + 1) as usize],
+                occupied: 0,
+            }
+        } else {
+            let data_type = std::mem::replace(&mut self.data_type, DataType::Null);
+
+            Mode::Fallback(GroupValuesPrimitive::new(data_type))
+        }
+    }
+
     fn build_native(&self, keys: Vec<u64>, null_idx: Option<usize>) -> ArrayRef {
         let values: Vec<T::Native> =
             keys.into_iter().map(T::Native::from_ordered_u64).collect();
-        Arc::new(
-            build_primitive::<T>(values, null_idx).with_data_type(self.data_type.clone()),
-        )
+        let array = build_primitive::<T>(values, null_idx);
+        if array.data_type() == &self.data_type {
+            return Arc::new(array);
+        }
+        Arc::new(array.with_data_type(self.data_type.clone()))
     }
 }
 

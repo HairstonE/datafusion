@@ -26,7 +26,7 @@ use arrow::array::types::{
 
 use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion_common::Result;
+use datafusion_common::{Result, ScalarValue};
 
 use datafusion_expr::EmitTo;
 
@@ -36,11 +36,15 @@ mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
 use datafusion_physical_expr::binary_map::OutputType;
+use datafusion_physical_expr::expressions::Column;
 use multi_group_by::GroupValuesColumn;
+
+use crate::statistics::{StatisticsArgs, StatisticsContext};
 
 pub(crate) use single_group_by::primitive::HashValue;
 
 use crate::aggregates::{
+    AggregateExec,
     group_values::single_group_by::{
         boolean::GroupValuesBoolean, bytes::GroupValuesBytes,
         bytes_view::GroupValuesBytesView, flat::GroupValuesFlatPrimitive,
@@ -120,6 +124,19 @@ pub trait GroupValues: Send {
     fn clear_shrink(&mut self, num_rows: usize);
 }
 
+pub(crate) struct FlatStatsHint {
+    min: ScalarValue,
+    max: ScalarValue,
+    distinct: Option<usize>,
+}
+
+pub fn new_group_values(
+    schema: SchemaRef,
+    group_ordering: &GroupOrdering,
+) -> Result<Box<dyn GroupValues>> {
+    new_group_values_hinted(schema, group_ordering, None)
+}
+
 /// Return a specialized implementation of [`GroupValues`] for the given schema.
 ///
 /// [`GroupValues`] implementations choosing logic:
@@ -136,16 +153,20 @@ pub trait GroupValues: Send {
 /// `GroupColumn`:  crate::aggregates::group_values::multi_group_by::GroupColumn
 /// `GroupValuesColumn`: crate::aggregates::group_values::multi_group_by::GroupValuesColumn
 /// `GroupValuesRows`: crate::aggregates::group_values::GroupValuesRows
-pub fn new_group_values(
+pub(crate) fn new_group_values_hinted(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
+    hint: Option<FlatStatsHint>,
 ) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
         macro_rules! flat_helper {
             ($t:ty) => {
-                return Ok(Box::new(GroupValuesFlatPrimitive::<$t>::new(d.clone())))
+                return Ok(Box::new(GroupValuesFlatPrimitive::<$t>::with_hint(
+                    d.clone(),
+                    hint,
+                )))
             };
         }
         match d {
@@ -229,6 +250,32 @@ pub fn new_group_values(
     } else {
         Ok(Box::new(GroupValuesRows::try_new(schema)?))
     }
+}
+
+pub(crate) fn flat_stats_hint(agg: &AggregateExec) -> Option<FlatStatsHint> {
+    let [(expr, _)] = agg.group_by.expr() else {
+        return None;
+    };
+    let col = expr.downcast_ref::<Column>()?;
+
+    if !agg
+        .input
+        .schema()
+        .field(col.index())
+        .data_type()
+        .is_integer()
+    {
+        return None;
+    }
+    let stats = StatisticsContext::new()
+        .compute(agg.input.as_ref(), &StatisticsArgs::new())
+        .ok()?;
+    let cs = stats.column_statistics.get(col.index())?;
+    Some(FlatStatsHint {
+        min: cs.min_value.get_value()?.clone(),
+        max: cs.max_value.get_value()?.clone(),
+        distinct: cs.distinct_count.get_value().copied(),
+    })
 }
 
 #[cfg(test)]
