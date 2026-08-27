@@ -25,7 +25,8 @@ use super::order::GroupOrdering;
 use super::skip_partial::SkipAggregationProbe;
 use super::{AggregateExec, format_human_display};
 use crate::aggregates::group_values::{
-    GroupByMetrics, GroupValues, flat_stats_hint, new_group_values, new_group_values_hinted,
+    GroupByMetrics, GroupValues, flat_stats_hint, new_group_values,
+    new_group_values_hinted,
 };
 use crate::aggregates::order::GroupOrderingFull;
 use crate::aggregates::{

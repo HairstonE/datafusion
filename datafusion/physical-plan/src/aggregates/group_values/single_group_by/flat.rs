@@ -1178,4 +1178,78 @@ mod tests {
         let out = flat.emit(EmitTo::All).unwrap();
         assert_eq!(out[0].data_type(), &dt, "emit must preserve the timezone");
     }
+
+    fn int32_hint(min: i32, max: i32, distinct: Option<usize>) -> FlatStatsHint {
+        FlatStatsHint {
+            min: ScalarValue::Int32(Some(min)),
+            max: ScalarValue::Int32(Some(max)),
+            distinct,
+        }
+    }
+
+    fn new_hinted(hint: FlatStatsHint) -> GroupValuesFlatPrimitive<Int32Type> {
+        GroupValuesFlatPrimitive::with_hint(DataType::Int32, Some(hint))
+    }
+
+    // Step 1 sizes the window from the hint, not the first batch: a hint spanning
+    // 0..=1000 keeps far-apart later keys in-window, where a scan of the narrow
+    // first batch [500] would have sized a 1-slot window and overflowed them.
+    #[test]
+    fn hint_sizes_window_beyond_first_batch() {
+        let mut gv = new_hinted(int32_hint(0, 1000, Some(1001)));
+        intern(&mut gv, &[Some(500)]);
+        intern(&mut gv, &[Some(0), Some(1000), Some(500)]);
+        assert!(
+            gv.overflow.is_empty(),
+            "hinted window must keep all keys in-window"
+        );
+        match &gv.mode {
+            Mode::Flat { data, .. } => assert_eq!(data.len(), 1001),
+            _ => panic!("expected a Flat window sized from the hint"),
+        }
+    }
+
+    // The hint's distinct count drives the sparsity guard: wide range + few distinct
+    // falls back to hash (step 1 -> step 3); a dense hint stays flat.
+    #[test]
+    fn hint_distinct_drives_guard() {
+        let mut sparse = new_hinted(int32_hint(0, 1000, Some(2)));
+        intern(&mut sparse, &[Some(0), Some(1000), Some(0)]);
+        assert!(matches!(sparse.mode, Mode::Fallback(_)));
+
+        let mut dense = new_hinted(int32_hint(0, 10, Some(11)));
+        intern(&mut dense, &[Some(5)]);
+        assert!(matches!(dense.mode, Mode::Flat { .. }));
+    }
+
+    // No hint must behave exactly like the dynamic first-batch path.
+    #[test]
+    fn no_hint_matches_dynamic_path() {
+        let data = &[Some(3), Some(1), None, Some(3), Some(7)];
+        let mut hinted_none =
+            GroupValuesFlatPrimitive::<Int32Type>::with_hint(DataType::Int32, None);
+        let mut plain = new_gv();
+        assert_eq!(intern(&mut hinted_none, data), intern(&mut plain, data));
+        assert_eq!(emit_all(&mut hinted_none), emit_all(&mut plain));
+    }
+
+    // A hint that under-reports the range is a perf hint, never a correctness risk:
+    // keys beyond the claimed window spill to overflow and still group correctly,
+    // matching the hash grouper exactly.
+    #[test]
+    fn wrong_hint_still_correct() {
+        let data = &[Some(0), Some(1), Some(1_000_000), Some(0), Some(1_000_000)];
+        let mut flat = new_hinted(int32_hint(0, 1, Some(2)));
+        let flat_groups = intern(&mut flat, data);
+
+        let mut hash = GroupValuesPrimitive::<Int32Type>::new(DataType::Int32);
+        let hash_groups = {
+            let col: ArrayRef = Arc::new(Int32Array::from(data.to_vec()));
+            let mut g = vec![];
+            hash.intern(&[col], &mut g).unwrap();
+            g
+        };
+        assert_eq!(flat_groups, hash_groups);
+        assert_eq!(emit_all(&mut flat), vec![Some(0), Some(1), Some(1_000_000)]);
+    }
 }
